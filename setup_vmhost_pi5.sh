@@ -152,6 +152,21 @@ fi
 ok "Verwende Benutzer: ${VM_USER}"
 
 ###########################################################
+# Aktives Netzwerkinterface erkennen
+###########################################################
+
+DEFAULT_IFACE=""
+if command -v ip >/dev/null 2>&1; then
+  DEFAULT_IFACE="$(ip route | awk '/default/ {print $5; exit}')"
+fi
+
+if [ -n "${DEFAULT_IFACE}" ]; then
+  ok "Aktives Netzwerkinterface erkannt: ${DEFAULT_IFACE}"
+else
+  warn "Konnte kein aktives Netzwerkinterface automatisch bestimmen."
+fi
+
+###########################################################
 # Paketinstallation
 ###########################################################
 
@@ -192,6 +207,57 @@ else
   else
     warn "Du hast die Paketinstallation abgelehnt. Einige Funktionen werden evtl. nicht funktionieren."
   fi
+fi
+
+###########################################################
+# Optional: Bridge-Interface br0 einrichten
+###########################################################
+
+BRIDGE_NAME="br0"
+LIBVIRT_NETWORK_NAME="default"
+BRIDGE_INTERFACE=""
+
+if [ -n "${DEFAULT_IFACE}" ]; then
+  BRIDGE_INTERFACE="${DEFAULT_IFACE}"
+fi
+
+if [ -n "${BRIDGE_INTERFACE}" ]; then
+  if [[ "${BRIDGE_INTERFACE}" =~ ^wl ]]; then
+    warn "Erkanntes Interface '${BRIDGE_INTERFACE}' scheint WLAN zu sein. Bridging kann damit problematisch sein."
+  fi
+
+  if ask_yes_no_default_no "Möchtest du eine Bridge '${BRIDGE_NAME}' über '${BRIDGE_INTERFACE}' einrichten?"; then
+    LIBVIRT_NETWORK_NAME="bridge"
+
+    if ip link show "${BRIDGE_NAME}" >/dev/null 2>&1; then
+      info "Bridge '${BRIDGE_NAME}' existiert bereits. Überspringe Erstellung."
+    else
+      info "Erstelle Konfiguration für Bridge '${BRIDGE_NAME}' (DHCP über Router)."
+
+      DHCPCD_CONF="/etc/dhcpcd.conf"
+      BRIDGE_INTERFACES_DIR="/etc/network/interfaces.d"
+      BRIDGE_INTERFACES_FILE="${BRIDGE_INTERFACES_DIR}/${BRIDGE_NAME}"
+
+      if [ -f "${DHCPCD_CONF}" ] && ! grep -Eq "^denyinterfaces\s+${BRIDGE_INTERFACE}(\s|$)" "${DHCPCD_CONF}"; then
+        info "Trage '${BRIDGE_INTERFACE}' in ${DHCPCD_CONF} als 'denyinterfaces' ein."
+        printf '\n# Konfiguration hinzugefügt durch setup_vmhost_pi5.sh\ndenyinterfaces %s\n' "${BRIDGE_INTERFACE}" >> "${DHCPCD_CONF}"
+      fi
+
+      mkdir -p "${BRIDGE_INTERFACES_DIR}"
+      cat > "${BRIDGE_INTERFACES_FILE}" <<EOF
+auto ${BRIDGE_NAME}
+iface ${BRIDGE_NAME} inet dhcp
+    bridge_ports ${BRIDGE_INTERFACE}
+    bridge_stp off
+    bridge_fd 0
+    bridge_maxwait 0
+EOF
+      ok "Bridge-Konfiguration unter ${BRIDGE_INTERFACES_FILE} angelegt."
+      warn "Bitte starte das Netzwerk neu oder führe einen Reboot durch, damit die Bridge aktiv wird."
+    fi
+  fi
+else
+  warn "Kein Netzwerkinterface erkannt – überspringe Bridge-Erstellung."
 fi
 
 ###########################################################
@@ -257,6 +323,41 @@ NETXML
 fi
 
 ###########################################################
+# Optional: libvirt-Netzwerk "bridge" einrichten
+###########################################################
+
+if [ "${LIBVIRT_NETWORK_NAME}" = "bridge" ] && command -v virsh >/dev/null 2>&1; then
+  info "Stelle libvirt-Netzwerk '${LIBVIRT_NETWORK_NAME}' bereit ..."
+
+  if virsh net-list --all | grep -q " ${LIBVIRT_NETWORK_NAME} "; then
+    info "Netzwerk '${LIBVIRT_NETWORK_NAME}' ist bereits definiert."
+  else
+    TMP_BRIDGE_XML=$(mktemp)
+    cat > "${TMP_BRIDGE_XML}" <<NETXML
+<network>
+  <name>${LIBVIRT_NETWORK_NAME}</name>
+  <forward mode='bridge'/>
+  <bridge name='${BRIDGE_NAME}'/>
+</network>
+NETXML
+    if virsh net-define "${TMP_BRIDGE_XML}"; then
+      ok "libvirt-Netzwerk '${LIBVIRT_NETWORK_NAME}' wurde definiert."
+    else
+      warn "Konnte libvirt-Netzwerk '${LIBVIRT_NETWORK_NAME}' nicht definieren."
+      LIBVIRT_NETWORK_NAME="default"
+    fi
+    rm -f "${TMP_BRIDGE_XML}"
+  fi
+
+  if [ "${LIBVIRT_NETWORK_NAME}" = "bridge" ]; then
+    if ! virsh net-info "${LIBVIRT_NETWORK_NAME}" | grep -q "Active:.*yes" 2>/dev/null; then
+      virsh net-start "${LIBVIRT_NETWORK_NAME}" || warn "Konnte Netzwerk '${LIBVIRT_NETWORK_NAME}' nicht starten."
+    fi
+    virsh net-autostart "${LIBVIRT_NETWORK_NAME}" >/dev/null 2>&1 || warn "Konnte Autostart für '${LIBVIRT_NETWORK_NAME}' nicht setzen."
+  fi
+fi
+
+###########################################################
 # Optional: Beispiel-VM (Ubuntu ARM64) anlegen
 ###########################################################
 
@@ -312,7 +413,7 @@ if ask_yes_no_default_no "Möchtest du jetzt eine Beispiel-VM (Ubuntu 22.04 ARM6
       --cpu host \
       --disk "path=${VM_DISK},format=qcow2" \
       --cdrom "${VM_ISO}" \
-      --network network=default \
+      --network "network=${LIBVIRT_NETWORK_NAME}" \
       --os-variant ubuntu22.04 \
       --boot uefi \
       --graphics gtk \
@@ -331,6 +432,12 @@ fi
 # Abschluss
 ###########################################################
 
+if [ "${LIBVIRT_NETWORK_NAME}" = "bridge" ]; then
+  BRIDGE_SUMMARY="Optional Bridge '${BRIDGE_NAME}' und libvirt-Netzwerk 'bridge' vorbereitet (falls gewählt)."
+else
+  BRIDGE_SUMMARY="Bridge-Konfiguration wurde übersprungen."
+fi
+
 cat <<EOF
 
 ${BOLD}FERTIG!${RESET}
@@ -340,6 +447,7 @@ Zusammenfassung:
 - libvirtd aktiviert/gestartet (sofern möglich).
 - Benutzer '${VM_USER}' zu Gruppen 'kvm' und 'libvirt' hinzugefügt.
 - libvirt-Standardnetzwerk 'default' geprüft/angelegt/aktiviert.
+- ${BRIDGE_SUMMARY}
 - Optional wurde eine Beispiel-VM erstellt (falls gewählt).
 
 WICHTIG:
